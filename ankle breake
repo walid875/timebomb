@@ -1,585 +1,728 @@
---[[
-    TARGET LOCK GUI - Roblox Studio LocalScript
-    ---------------------------------------------------------------
-    Install this LocalScript in your own Roblox experience at:
-        StarterPlayer > StarterPlayerScripts
-
-    Behavior:
-      * Requires a Tool named timebomb (case-insensitive) in the Character
-        or Backpack before starting.
-      * Locks the nearest living player once when Start is pressed.
-      * Does NOT switch targets just because someone else becomes closer.
-      * Releases the lock and stops following if the required Tool is lost.
-      * Uses PathfindingService to navigate around obstacles.
-
-    This is designed for a game you own in Roblox Studio, not an executor.
-]]
-
+-- Services
 local Players = game:GetService("Players")
-local PathfindingService = game:GetService("PathfindingService")
-local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
 local UserInputService = game:GetService("UserInputService")
+local UserGameSettings = UserSettings():GetService("UserGameSettings")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local localPlayer = Players.LocalPlayer
-local playerGui = localPlayer:WaitForChild("PlayerGui")
+--------------------------------------------------------------------------------
+-- GLOBAL STATE
+--------------------------------------------------------------------------------
+local autoWalkEnabled = false
+local bombUtilEnabled = false
+local easyDribbleEnabled = false
+local currentTarget = nil
+local floatingGui = nil
+local floatingButton = nil
 
--- Colors
-local C = {
-    background = Color3.fromRGB(16, 19, 29),
-    panel = Color3.fromRGB(23, 28, 42),
-    panel2 = Color3.fromRGB(31, 38, 55),
-    text = Color3.fromRGB(242, 246, 255),
-    muted = Color3.fromRGB(145, 157, 180),
-    accent = Color3.fromRGB(104, 113, 255),
-    accent2 = Color3.fromRGB(53, 199, 255),
-    green = Color3.fromRGB(65, 220, 155),
-    red = Color3.fromRGB(255, 96, 112),
-    yellow = Color3.fromRGB(255, 193, 79),
-    stroke = Color3.fromRGB(67, 78, 111),
+local connections = {}
+local espConnections = {}
+local originalHitboxSizes = {}
+local originalHighSizes = {}
+local lightingBackup = nil
+local savedHumanoidState = nil
+
+local lastPosition = nil
+local stuckTime = 0
+local STUCK_THRESHOLD = 0.4
+
+local flipTime = 0
+local holdingBomb = false
+local reactionTime = 0
+local equippedTime = 0
+
+--------------------------------------------------------------------------------
+-- HELPERS
+--------------------------------------------------------------------------------
+local function connect(signal, callback)
+	local conn = signal:Connect(callback)
+	table.insert(connections, conn)
+	return conn
+end
+
+local function clearEspConnections()
+	for _, conn in ipairs(espConnections) do
+		if conn.Connected then
+			conn:Disconnect()
+		end
+	end
+	table.clear(espConnections)
+end
+
+local function restoreHitboxes()
+	for player, original in pairs(originalHitboxSizes) do
+		if player and player.Character then
+			local root = player.Character:FindFirstChild("HumanoidRootPart")
+			if root then
+				root.Size = original.Size
+				root.CanCollide = original.CanCollide
+				root.Transparency = original.Transparency
+			end
+		end
+	end
+	table.clear(originalHitboxSizes)
+end
+
+local function restoreHighSizes()
+	for player, original in pairs(originalHighSizes) do
+		if player and player.Character then
+			local root = player.Character:FindFirstChild("HumanoidRootPart")
+			if root then
+				root.Size = original.Size
+				root.CanCollide = original.CanCollide
+				root.Transparency = original.Transparency
+			end
+		end
+	end
+	table.clear(originalHighSizes)
+end
+
+local function restoreLighting()
+	if lightingBackup then
+		Lighting.GlobalShadows = lightingBackup.GlobalShadows
+		for effect, enabled in pairs(lightingBackup.Effects) do
+			if effect and effect.Parent then
+				effect.Enabled = enabled
+			end
+		end
+		lightingBackup = nil
+	end
+end
+
+local function restoreHumanoid()
+	local char = LocalPlayer.Character
+	if char and savedHumanoidState then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum.WalkSpeed = savedHumanoidState.WalkSpeed
+			hum.AutoRotate = savedHumanoidState.AutoRotate
+		end
+	end
+	savedHumanoidState = nil
+end
+
+--------------------------------------------------------------------------------
+-- 1. UI LIBRARY
+--------------------------------------------------------------------------------
+local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/walid875/hanlin/refs/heads/main/uilibrary"))()
+local mainWindow = library:CreateWindow('Combat & Utility Hub')
+local tab = library:CreateWindow('Main Features')
+
+--------------------------------------------------------------------------------
+-- 2. FLOATING AUTO-WALK GUI
+--------------------------------------------------------------------------------
+local function updateFloatingButtonVisuals()
+	if not floatingButton then return end
+	if autoWalkEnabled then
+		floatingButton.Text = "ON"
+		floatingButton.BackgroundColor3 = Color3.fromRGB(45, 190, 85)
+	else
+		floatingButton.Text = "OFF"
+		floatingButton.BackgroundColor3 = Color3.fromRGB(190, 45, 45)
+	end
+end
+
+local function destroyAutoWalkGui()
+	if floatingGui then
+		floatingGui:Destroy()
+		floatingGui = nil
+		floatingButton = nil
+	end
+end
+
+local function spawnAutoWalkGui()
+	if floatingGui then return end
+
+	local ScreenGui = Instance.new("ScreenGui")
+	ScreenGui.Name = "FloatingAutoWalkUI"
+	ScreenGui.ResetOnSpawn = false
+	ScreenGui.Parent = PlayerGui
+
+	local MainFrame = Instance.new("Frame")
+	MainFrame.Name = "MainFrame"
+	MainFrame.Parent = ScreenGui
+	MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+	MainFrame.Position = UDim2.new(0.5, -100, 0.4, -35)
+	MainFrame.Size = UDim2.new(0, 200, 0, 75)
+	MainFrame.Active = true
+	MainFrame.Draggable = true
+
+	local UICorner = Instance.new("UICorner")
+	UICorner.CornerRadius = UDim.new(0, 12)
+	UICorner.Parent = MainFrame
+
+	local UIStroke = Instance.new("UIStroke")
+	UIStroke.Parent = MainFrame
+	UIStroke.Color = Color3.fromRGB(70, 70, 85)
+	UIStroke.Thickness = 1.5
+
+	local TitleLabel = Instance.new("TextLabel")
+	TitleLabel.Name = "Title"
+	TitleLabel.Parent = MainFrame
+	TitleLabel.BackgroundTransparency = 1
+	TitleLabel.Position = UDim2.new(0, 0, 0, 8)
+	TitleLabel.Size = UDim2.new(1, 0, 0, 20)
+	TitleLabel.Font = Enum.Font.GothamBold
+	TitleLabel.Text = "AUTO WALK [T]"
+	TitleLabel.TextColor3 = Color3.fromRGB(240, 240, 240)
+	TitleLabel.TextSize = 13
+
+	local ModernToggleButton = Instance.new("TextButton")
+	ModernToggleButton.Name = "ToggleButton"
+	ModernToggleButton.Parent = MainFrame
+	ModernToggleButton.BackgroundColor3 = Color3.fromRGB(190, 45, 45)
+	ModernToggleButton.Position = UDim2.new(0.1, 0, 0.48, 0)
+	ModernToggleButton.Size = UDim2.new(0.8, 0, 0, 28)
+	ModernToggleButton.Font = Enum.Font.GothamSemibold
+	ModernToggleButton.Text = "OFF"
+	ModernToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	ModernToggleButton.TextSize = 12
+
+	local ButtonCorner = Instance.new("UICorner")
+	ButtonCorner.CornerRadius = UDim.new(0, 8)
+	ButtonCorner.Parent = ModernToggleButton
+
+	floatingGui = ScreenGui
+	floatingButton = ModernToggleButton
+
+	ModernToggleButton.MouseButton1Click:Connect(function()
+		autoWalkEnabled = not autoWalkEnabled
+		updateFloatingButtonVisuals()
+	end)
+
+	updateFloatingButtonVisuals()
+end
+
+--------------------------------------------------------------------------------
+-- 3. AUTO WALK + ANTI-STUCK
+--------------------------------------------------------------------------------
+connect(RunService.Heartbeat, function()
+	if not autoWalkEnabled then
+		currentTarget = nil
+		return
+	end
+
+	local char = LocalPlayer.Character
+	if not char then
+		currentTarget = nil
+		return
+	end
+
+	local root = char:FindFirstChild("HumanoidRootPart")
+	local tool = char:FindFirstChildOfClass("Tool")
+	if not root or not tool then
+		currentTarget = nil
+		return
+	end
+
+	local bestTarget, bestDist = nil, math.huge
+	for _, target in ipairs(Players:GetPlayers()) do
+		if target == LocalPlayer then continue end
+		local targetChar = target.Character
+		if not targetChar then continue end
+
+		local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+		local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
+		if not targetRoot or not targetHum or targetHum.Health <= 0 then continue end
+
+		local dist = (root.Position - targetRoot.Position).Magnitude
+		if dist < bestDist then
+			bestDist = dist
+			bestTarget = target
+		end
+	end
+	currentTarget = bestTarget
+end)
+
+connect(RunService.RenderStepped, function(dt)
+	if not autoWalkEnabled then
+		lastPosition = nil
+		stuckTime = 0
+		return
+	end
+
+	local char = LocalPlayer.Character
+	if not char then return end
+
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	local tool = char:FindFirstChildOfClass("Tool")
+	if not hum or not root or not tool then return end
+
+	local velocity = root.AssemblyLinearVelocity
+	local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+	local moved = 999
+
+	if lastPosition then
+		moved = (root.Position - lastPosition).Magnitude
+	end
+	lastPosition = root.Position
+
+	if horizontalSpeed < 1.0 and moved < 0.4 then
+		stuckTime += dt
+		if stuckTime >= STUCK_THRESHOLD then
+			hum.Jump = true
+			stuckTime = 0
+		end
+	else
+		stuckTime = 0
+	end
+
+	local targetChar = currentTarget and currentTarget.Character
+	if not targetChar then return end
+
+	local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+	local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
+	if not targetRoot or not targetHum or targetHum.Health <= 0 then return end
+
+	local targetPos = targetRoot.Position
+	hum:MoveTo(targetPos)
+
+	if (root.Position - targetPos).Magnitude < 2 then
+		hum:MoveTo(targetPos + targetRoot.CFrame.LookVector * 2)
+	end
+end)
+
+connect(UserInputService.InputBegan, function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode == Enum.KeyCode.T then
+		autoWalkEnabled = not autoWalkEnabled
+		if autoWalkEnabled then
+			spawnAutoWalkGui()
+		end
+		updateFloatingButtonVisuals()
+	end
+end)
+
+--------------------------------------------------------------------------------
+-- 4. BOMB UTILITY
+--------------------------------------------------------------------------------
+local OTHER_HITBOX_SIZE = Vector3.new(10, 10, 10)
+local SPEED = 18
+local MY_BOMB_RANGE = 10
+local FLIP_ANGLE = 45
+local FLIP_SPEED = 30
+local ESP_COLOR = Color3.fromRGB(255, 255, 255)
+local TIMEBOMB_NAMES = {"TimeBomb", "Timebomb", "timebomb"}
+
+local function isHoldingTimeBomb()
+	local character = LocalPlayer.Character
+	if not character then return false end
+	for _, name in ipairs(TIMEBOMB_NAMES) do
+		if character:FindFirstChild(name) then return true end
+	end
+	return false
+end
+
+local function hasTimeBomb(player)
+	local character = player.Character
+	local backpack = player:FindFirstChild("Backpack")
+	for _, name in ipairs(TIMEBOMB_NAMES) do
+		if character and character:FindFirstChild(name) then return true end
+		if backpack and backpack:FindFirstChild(name) then return true end
+	end
+	return false
+end
+
+local function getTarget()
+	local character = LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root or not hasTimeBomb(LocalPlayer) then return nil end
+
+	local closestTarget, closestDistance = nil, MY_BOMB_RANGE
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local targetRoot = player.Character:FindFirstChild("HumanoidRootPart")
+			if targetRoot then
+				local distance = (root.Position - targetRoot.Position).Magnitude
+				if distance <= closestDistance then
+					closestDistance = distance
+					closestTarget = player
+				end
+			end
+		end
+	end
+	return closestTarget
+end
+
+local function addESP(player, character)
+	if player == LocalPlayer or not bombUtilEnabled then return end
+	local old = character:FindFirstChild("SimpleESP")
+	if old then old:Destroy() end
+
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "SimpleESP"
+	highlight.Adornee = character
+	highlight.FillColor = ESP_COLOR
+	highlight.OutlineColor = ESP_COLOR
+	highlight.FillTransparency = 0.75
+	highlight.OutlineTransparency = 0
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.Parent = character
+end
+
+local function removeESP(player)
+	if player.Character then
+		local esp = player.Character:FindFirstChild("SimpleESP")
+		if esp then esp:Destroy() end
+	end
+end
+
+local function setupPlayer(player)
+	if player == LocalPlayer then return end
+	if player.Character then
+		addESP(player, player.Character)
+	end
+	local conn = player.CharacterAdded:Connect(function(character)
+		task.wait(0.15)
+		if bombUtilEnabled then
+			addESP(player, character)
+		end
+		originalHitboxSizes[player] = nil
+	end)
+	table.insert(espConnections, conn)
+end
+
+connect(RunService.Heartbeat, function()
+	if not bombUtilEnabled then return end
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local root = player.Character:FindFirstChild("HumanoidRootPart")
+			if root then
+				if not originalHitboxSizes[player] then
+					originalHitboxSizes[player] = {
+						Size = root.Size,
+						CanCollide = root.CanCollide,
+						Transparency = root.Transparency
+					}
+				end
+				root.Size = OTHER_HITBOX_SIZE
+				root.CanCollide = false
+				root.Transparency = 0.7
+			end
+		end
+	end
+end)
+
+connect(RunService.RenderStepped, function(dt)
+	if not bombUtilEnabled then return end
+
+	local character = LocalPlayer.Character
+	if not character then return end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root then return end
+
+	humanoid.WalkSpeed = SPEED
+
+	local currentlyHolding = isHoldingTimeBomb()
+	if currentlyHolding and not holdingBomb then
+		holdingBomb = true
+		equippedTime = os.clock()
+		reactionTime = math.random(150, 350) / 1000
+	elseif not currentlyHolding and holdingBomb then
+		holdingBomb = false
+		flipTime = 0
+		humanoid.AutoRotate = true
+	end
+
+	if not holdingBomb or (os.clock() - equippedTime) < reactionTime then
+		humanoid.AutoRotate = true
+		flipTime = 0
+		return
+	end
+
+	local target = getTarget()
+	if not target or not target.Character then
+		humanoid.AutoRotate = true
+		flipTime = 0
+		return
+	end
+
+	local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then
+		humanoid.AutoRotate = true
+		flipTime = 0
+		return
+	end
+
+	humanoid.AutoRotate = false
+
+	local direction = Vector3.new(
+		targetRoot.Position.X - root.Position.X,
+		0,
+		targetRoot.Position.Z - root.Position.Z
+	)
+
+	if direction.Magnitude < 0.01 then return end
+	direction = direction.Unit
+
+	flipTime += dt
+	local flipAngle = math.sin(flipTime * FLIP_SPEED) * math.rad(FLIP_ANGLE)
+	local lookAtTarget = CFrame.lookAt(root.Position, root.Position + direction)
+	root.CFrame = lookAtTarget * CFrame.Angles(0, flipAngle, 0)
+end)
+
+--------------------------------------------------------------------------------
+-- 5. PROFESSIONAL DRIBBLE (PREDICTIVE, ADAPTIVE & JITTER-FREE)
+--------------------------------------------------------------------------------
+local HIGH_SIZE = Vector3.new(2.5, 13, 2.5)
+local AIM_BIND_NAME = "ProDribbleAimLock"
+
+local DRIBBLE_CONFIG = {
+	MaxRange = 14,
+	FieldOfView = 140,
+	MinSpeed = 16,
+	MaxSpeed = 38,
+	PredictionTime = 0.14,
+	DeadzoneDegrees = 0.6,
+	TargetHysteresis = 2.0
 }
 
-local function make(className, props, parent)
-    local obj = Instance.new(className)
-    for key, value in pairs(props or {}) do
-        obj[key] = value
-    end
-    obj.Parent = parent
-    return obj
+local activeDribbleTarget = nil
+
+local function isTargetValid(pChar, root)
+	if not pChar or not pChar:FindFirstChildOfClass("Tool") then return false end
+	local pRoot = pChar:FindFirstChild("HumanoidRootPart")
+	local pHum = pChar:FindFirstChildOfClass("Humanoid")
+	if not pRoot or not pHum or pHum.Health <= 0 then return false end
+
+	local offset = pRoot.Position - root.Position
+	local dist = Vector3.new(offset.X, 0, offset.Z).Magnitude
+	if dist > DRIBBLE_CONFIG.MaxRange then return false end
+
+	local lookFlat = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z).Unit
+	local dirFlat = Vector3.new(offset.X, 0, offset.Z).Unit
+	local angle = math.deg(math.acos(math.clamp(lookFlat:Dot(dirFlat), -1, 1)))
+	if angle > (DRIBBLE_CONFIG.FieldOfView * 0.5) then return false end
+
+	return true, dist, pRoot
 end
 
-local function corner(parent, radius)
-    return make("UICorner", { CornerRadius = UDim.new(0, radius or 12) }, parent)
+local function getBestDribbleTarget(root)
+	if activeDribbleTarget and activeDribbleTarget.Parent then
+		local valid, dist, pRoot = isTargetValid(activeDribbleTarget.Parent, root)
+		if valid and dist <= (DRIBBLE_CONFIG.MaxRange + DRIBBLE_CONFIG.TargetHysteresis) then
+			return pRoot
+		end
+	end
+
+	local bestTarget = nil
+	local lowestScore = math.huge
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player == LocalPlayer then continue end
+		local pChar = player.Character
+		if not pChar then continue end
+
+		local valid, dist, pRoot = isTargetValid(pChar, root)
+		if valid then
+			local relVel = pRoot.AssemblyLinearVelocity - root.AssemblyLinearVelocity
+			local toMe = (root.Position - pRoot.Position).Unit
+			local closingFactor = math.clamp(relVel:Dot(toMe) * 0.2, -3, 3)
+			local score = dist - closingFactor
+
+			if score < lowestScore then
+				lowestScore = score
+				bestTarget = pRoot
+			end
+		end
+	end
+
+	activeDribbleTarget = bestTarget
+	return bestTarget
 end
 
-local function stroke(parent, color, transparency, thickness)
-    return make("UIStroke", {
-        Color = color or C.stroke,
-        Transparency = transparency or 0,
-        Thickness = thickness or 1,
-    }, parent)
+local function applyAdaptiveFacing(root, targetRoot, dt)
+	local targetVel = targetRoot.AssemblyLinearVelocity
+	local predictedPos = targetRoot.Position + Vector3.new(targetVel.X, 0, targetVel.Z) * DRIBBLE_CONFIG.PredictionTime
+
+	local toTarget = predictedPos - root.Position
+	local flatDir = Vector3.new(toTarget.X, 0, toTarget.Z)
+	if flatDir.Magnitude < 0.2 then return end
+	flatDir = flatDir.Unit
+
+	local currentLook = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z).Unit
+	local dotProduct = math.clamp(currentLook:Dot(flatDir), -1, 1)
+	local angularError = math.deg(math.acos(dotProduct))
+
+	if angularError <= DRIBBLE_CONFIG.DeadzoneDegrees then return end
+
+	local turnProgress = math.clamp(angularError / 90, 0, 1)
+	local currentSpeed = DRIBBLE_CONFIG.MinSpeed + (DRIBBLE_CONFIG.MaxSpeed - DRIBBLE_CONFIG.MinSpeed) * (turnProgress ^ 1.5)
+
+	local desiredCFrame = CFrame.lookAt(root.Position, root.Position + flatDir)
+	local alpha = 1 - math.exp(-currentSpeed * dt)
+	root.CFrame = root.CFrame:Lerp(desiredCFrame, alpha)
 end
 
-local oldGui = playerGui:FindFirstChild("TargetLockModernGUI")
-if oldGui then
-    oldGui:Destroy()
-end
+connect(RunService.Heartbeat, function()
+	if not easyDribbleEnabled then return end
 
-local gui = make("ScreenGui", {
-    Name = "TargetLockModernGUI",
-    ResetOnSpawn = false,
-    IgnoreGuiInset = false,
-    DisplayOrder = 50,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-}, playerGui)
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player == LocalPlayer then continue end
+		local char = player.Character
+		if not char then continue end
 
-local shadow = make("Frame", {
-    Name = "Shadow",
-    AnchorPoint = Vector2.new(0, 0.5),
-    Position = UDim2.new(0, 28, 0.5, 5),
-    Size = UDim2.fromOffset(326, 282),
-    BackgroundColor3 = Color3.new(0, 0, 0),
-    BackgroundTransparency = 0.58,
-    BorderSizePixel = 0,
-    ZIndex = 0,
-}, gui)
-corner(shadow, 20)
+		local root = char:FindFirstChild("HumanoidRootPart")
+		if not root then continue end
 
-local main = make("Frame", {
-    Name = "Main",
-    AnchorPoint = Vector2.new(0, 0.5),
-    Position = UDim2.new(0, 24, 0.5, 0),
-    Size = UDim2.fromOffset(326, 282),
-    BackgroundColor3 = C.background,
-    BorderSizePixel = 0,
-    ZIndex = 1,
-}, gui)
-corner(main, 20)
-stroke(main, C.stroke, 0.25, 1.2)
-make("UIGradient", {
-    Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(26, 31, 48)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(15, 18, 27)),
-    }),
-    Rotation = 120,
-}, main)
+		if not originalHighSizes[player] then
+			originalHighSizes[player] = {
+				Size = root.Size,
+				CanCollide = root.CanCollide,
+				Transparency = root.Transparency
+			}
+		end
 
--- Header / drag surface
-local header = make("Frame", {
-    Name = "Header",
-    Position = UDim2.fromOffset(0, 0),
-    Size = UDim2.new(1, 0, 0, 72),
-    BackgroundTransparency = 1,
-    Active = true,
-    ZIndex = 2,
-}, main)
-
-local logo = make("Frame", {
-    Name = "Logo",
-    Position = UDim2.fromOffset(18, 17),
-    Size = UDim2.fromOffset(38, 38),
-    BackgroundColor3 = C.accent,
-    BorderSizePixel = 0,
-    ZIndex = 3,
-}, header)
-corner(logo, 12)
-make("UIGradient", {
-    Color = ColorSequence.new(C.accent, C.accent2),
-    Rotation = 40,
-}, logo)
-make("TextLabel", {
-    BackgroundTransparency = 1,
-    Size = UDim2.fromScale(1, 1),
-    Font = Enum.Font.GothamBold,
-    Text = "TL",
-    TextSize = 16,
-    TextColor3 = Color3.new(1, 1, 1),
-    ZIndex = 4,
-}, logo)
-
-make("TextLabel", {
-    Name = "Title",
-    Position = UDim2.fromOffset(67, 15),
-    Size = UDim2.new(1, -92, 0, 25),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.GothamBold,
-    Text = "TARGET LOCK",
-    TextSize = 16,
-    TextColor3 = C.text,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 3,
-}, header)
-make("TextLabel", {
-    Name = "Subtitle",
-    Position = UDim2.fromOffset(68, 39),
-    Size = UDim2.new(1, -90, 0, 18),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.Gotham,
-    Text = "FOLLOW CONTROL  /  STUDIO",
-    TextSize = 9,
-    TextColor3 = C.muted,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 3,
-}, header)
-
-local divider = make("Frame", {
-    Position = UDim2.new(0, 18, 0, 72),
-    Size = UDim2.new(1, -36, 0, 1),
-    BackgroundColor3 = C.stroke,
-    BackgroundTransparency = 0.45,
-    BorderSizePixel = 0,
-    ZIndex = 2,
-}, main)
-
-local statusCard = make("Frame", {
-    Name = "StatusCard",
-    Position = UDim2.fromOffset(18, 86),
-    Size = UDim2.new(1, -36, 0, 48),
-    BackgroundColor3 = C.panel,
-    BorderSizePixel = 0,
-    ZIndex = 2,
-}, main)
-corner(statusCard, 12)
-
-local statusDot = make("Frame", {
-    Name = "StatusDot",
-    Position = UDim2.fromOffset(13, 18),
-    Size = UDim2.fromOffset(9, 9),
-    BackgroundColor3 = C.yellow,
-    BorderSizePixel = 0,
-    ZIndex = 3,
-}, statusCard)
-corner(statusDot, 20)
-
-local statusText = make("TextLabel", {
-    Name = "StatusText",
-    Position = UDim2.fromOffset(31, 7),
-    Size = UDim2.new(1, -42, 0, 18),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.GothamSemibold,
-    Text = "STANDBY",
-    TextSize = 11,
-    TextColor3 = C.text,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 3,
-}, statusCard)
-
-local statusHint = make("TextLabel", {
-    Name = "StatusHint",
-    Position = UDim2.fromOffset(31, 24),
-    Size = UDim2.new(1, -42, 0, 15),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.Gotham,
-    Text = "Waiting for activation",
-    TextSize = 10,
-    TextColor3 = C.muted,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 3,
-}, statusCard)
-
-local targetCard = make("Frame", {
-    Name = "TargetCard",
-    Position = UDim2.fromOffset(18, 143),
-    Size = UDim2.new(1, -36, 0, 48),
-    BackgroundColor3 = C.panel,
-    BorderSizePixel = 0,
-    ZIndex = 2,
-}, main)
-corner(targetCard, 12)
-
-make("TextLabel", {
-    Position = UDim2.fromOffset(13, 6),
-    Size = UDim2.new(1, -26, 0, 14),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.GothamMedium,
-    Text = "LOCKED TARGET",
-    TextSize = 9,
-    TextColor3 = C.muted,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 3,
-}, targetCard)
-
-local targetName = make("TextLabel", {
-    Name = "TargetName",
-    Position = UDim2.fromOffset(13, 20),
-    Size = UDim2.new(1, -26, 0, 20),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.GothamSemibold,
-    Text = "No target selected",
-    TextSize = 12,
-    TextColor3 = C.text,
-    TextTruncate = Enum.TextTruncate.AtEnd,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 3,
-}, targetCard)
-
-local toolLine = make("Frame", {
-    Name = "ToolLine",
-    Position = UDim2.fromOffset(18, 199),
-    Size = UDim2.new(1, -36, 0, 18),
-    BackgroundTransparency = 1,
-    ZIndex = 2,
-}, main)
-
-local toolDot = make("Frame", {
-    Position = UDim2.fromOffset(1, 5),
-    Size = UDim2.fromOffset(7, 7),
-    BackgroundColor3 = C.red,
-    BorderSizePixel = 0,
-    ZIndex = 3,
-}, toolLine)
-corner(toolDot, 20)
-local toolText = make("TextLabel", {
-    Name = "ToolText",
-    Position = UDim2.fromOffset(14, 0),
-    Size = UDim2.new(1, -14, 1, 0),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.Gotham,
-    Text = "TIMEBOMB  •  NOT FOUND",
-    TextSize = 9,
-    TextColor3 = C.muted,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 3,
-}, toolLine)
-
-local toggleButton = make("TextButton", {
-    Name = "ToggleButton",
-    Position = UDim2.fromOffset(18, 225),
-    Size = UDim2.new(1, -36, 0, 40),
-    BackgroundColor3 = C.accent,
-    BorderSizePixel = 0,
-    AutoButtonColor = false,
-    Font = Enum.Font.GothamBold,
-    Text = "LOCK NEAREST  →",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 12,
-    ZIndex = 3,
-}, main)
-corner(toggleButton, 12)
-make("UIGradient", {
-    Color = ColorSequence.new(C.accent, C.accent2),
-    Rotation = 0,
-}, toggleButton)
-
-local footer = make("TextLabel", {
-    Position = UDim2.fromOffset(18, 268),
-    Size = UDim2.new(1, -36, 0, 10),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.Gotham,
-    Text = "TARGET STAYS LOCKED UNTIL TOOL IS LOST",
-    TextSize = 8,
-    TextColor3 = C.muted,
-    TextXAlignment = Enum.TextXAlignment.Center,
-    ZIndex = 2,
-}, main)
-
--- Drag the window by its header.
-local dragging = false
-local dragStart = nil
-local startPosition = nil
-header.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPosition = main.Position
-        input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
-                dragging = false
-            end
-        end)
-    end
-end)
-UserInputService.InputChanged:Connect(function(input)
-    if dragging and dragStart and startPosition
-        and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local delta = input.Position - dragStart
-        main.Position = UDim2.new(
-            startPosition.X.Scale, startPosition.X.Offset + delta.X,
-            startPosition.Y.Scale, startPosition.Y.Offset + delta.Y
-        )
-        shadow.Position = UDim2.new(
-            main.Position.X.Scale, main.Position.X.Offset + 4,
-            main.Position.Y.Scale, main.Position.Y.Offset + 5
-        )
-    end
+		root.Size = HIGH_SIZE
+		root.CanCollide = true
+		root.Transparency = 0.85
+	end
 end)
 
--- Targeting and following
-local tracking = false
-local lockedTarget = nil
-local pathBusy = false
-local lastPathAt = 0
-local runToken = 0
-local lastDistanceUpdate = 0
+local function startAimBinding()
+	RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Character.Value + 1, function(dt)
+		if not easyDribbleEnabled then return end
 
-local function hasTimebomb()
-    local function hasIn(container)
-        if not container then return false end
-        for _, child in ipairs(container:GetChildren()) do
-            if child:IsA("Tool") and string.lower(child.Name) == "timebomb" then
-                return true
-            end
-        end
-        return false
-    end
-    return hasIn(localPlayer.Character) or hasIn(localPlayer:FindFirstChildOfClass("Backpack"))
+		local char = LocalPlayer.Character
+		if not char then return end
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		local root = char:FindFirstChild("HumanoidRootPart")
+		if not hum or not root or hum.Health <= 0 then return end
+
+		local state = hum:GetState()
+		if state == Enum.HumanoidStateType.Physics or state == Enum.HumanoidStateType.Ragdoll or hum.Sit then
+			return
+		end
+
+		local targetRoot = getBestDribbleTarget(root)
+
+		if targetRoot then
+			hum.AutoRotate = false
+
+			pcall(function()
+				UserGameSettings.RotationType = Enum.RotationType.MovementRelative
+			end)
+
+			applyAdaptiveFacing(root, targetRoot, dt)
+		else
+			activeDribbleTarget = nil
+			hum.AutoRotate = true
+		end
+	end)
 end
 
-local function getAliveCharacter(player)
-    if not player then return nil, nil, nil end
-    local character = player.Character
-    if not character then return nil, nil, nil end
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    local root = character:FindFirstChild("HumanoidRootPart")
-    if not humanoid or humanoid.Health <= 0 or not root then
-        return character, humanoid, nil
-    end
-    return character, humanoid, root
+local function stopAimBinding()
+	activeDribbleTarget = nil
+	pcall(function()
+		RunService:UnbindFromRenderStep(AIM_BIND_NAME)
+	end)
 end
 
-local function nearestPlayer()
-    local _, _, myRoot = getAliveCharacter(localPlayer)
-    if not myRoot then return nil end
-    local closest = nil
-    local closestDistance = math.huge
-    for _, other in ipairs(Players:GetPlayers()) do
-        if other ~= localPlayer then
-            local _, _, otherRoot = getAliveCharacter(other)
-            if otherRoot then
-                local distance = (myRoot.Position - otherRoot.Position).Magnitude
-                if distance < closestDistance then
-                    closestDistance = distance
-                    closest = other
-                end
-            end
-        end
-    end
-    return closest
-end
+--------------------------------------------------------------------------------
+-- 6. UI TOGGLES
+--------------------------------------------------------------------------------
+local playerAddedConnection
 
-local function setStatus(title, hint, color)
-    statusText.Text = title
-    statusHint.Text = hint
-    statusDot.BackgroundColor3 = color
-end
+tab:AddToggle({
+	text = 'Auto Walk To Target',
+	flag = 'auto_walk',
+	callback = function(enabled)
+		autoWalkEnabled = enabled
+		if enabled then
+			spawnAutoWalkGui()
+		end
+		updateFloatingButtonVisuals()
+	end
+})
 
-local function setToolStatus()
-    if hasTimebomb() then
-        toolText.Text = "TIMEBOMB  •  READY"
-        toolDot.BackgroundColor3 = C.green
-    else
-        toolText.Text = "TIMEBOMB  •  NOT FOUND"
-        toolDot.BackgroundColor3 = C.red
-    end
-end
+tab:AddToggle({
+	text = 'Bomb Mod Utility',
+	flag = 'bomb_utility',
+	callback = function(enabled)
+		bombUtilEnabled = enabled
+		if enabled then
+			lightingBackup = {
+				GlobalShadows = Lighting.GlobalShadows,
+				Effects = {}
+			}
+			Lighting.GlobalShadows = false
+			for _, obj in ipairs(Lighting:GetDescendants()) do
+				if obj:IsA("BloomEffect") or obj:IsA("BlurEffect") or obj:IsA("SunRaysEffect") or obj:IsA("DepthOfFieldEffect") then
+					lightingBackup.Effects[obj] = obj.Enabled
+					obj.Enabled = false
+				end
+			end
 
-local function softStop()
-    local _, humanoid, root = getAliveCharacter(localPlayer)
-    if humanoid and root then
-        humanoid:MoveTo(root.Position)
-    end
-end
+			local char = LocalPlayer.Character
+			if char then
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				if hum then
+					savedHumanoidState = {
+						WalkSpeed = hum.WalkSpeed,
+						AutoRotate = hum.AutoRotate
+					}
+				end
+			end
 
-local function releaseLock(reason)
-    tracking = false
-    lockedTarget = nil
-    runToken += 1
-    softStop()
-    targetName.Text = "No target selected"
-    toggleButton.Text = "LOCK NEAREST  →"
-    toggleButton.BackgroundColor3 = C.accent
-    setToolStatus()
-    if reason == "tool" then
-        setStatus("TOOL LOST", "Following stopped • target released", C.red)
-    elseif reason == "manual" then
-        setStatus("STANDBY", "Target lock released", C.yellow)
-    else
-        setStatus("STANDBY", "Waiting for activation", C.yellow)
-    end
-end
+			clearEspConnections()
+			for _, player in ipairs(Players:GetPlayers()) do
+				setupPlayer(player)
+			end
+			playerAddedConnection = Players.PlayerAdded:Connect(setupPlayer)
+			table.insert(connections, playerAddedConnection)
+		else
+			for _, player in ipairs(Players:GetPlayers()) do
+				removeESP(player)
+			end
+			clearEspConnections()
+			if playerAddedConnection then
+				playerAddedConnection:Disconnect()
+				playerAddedConnection = nil
+			end
 
-local function destinationNearTarget(targetRoot, myRoot)
-    local offset = myRoot.Position - targetRoot.Position
-    if offset.Magnitude < 0.05 then
-        offset = Vector3.new(1, 0, 0)
-    end
-    -- Stop a few studs away instead of trying to occupy the target's exact position.
-    return targetRoot.Position + offset.Unit * 3.2
-end
+			restoreHitboxes()
+			restoreLighting()
+			restoreHumanoid()
+		end
+	end
+})
 
-local function requestPath(targetPlayer, token)
-    if pathBusy or not tracking or not hasTimebomb() then return end
-    if os.clock() - lastPathAt < 0.55 then return end
+tab:AddToggle({
+	text = 'Easy Dribble (High + Aim)',
+	flag = 'easy_dribble',
+	callback = function(enabled)
+		easyDribbleEnabled = enabled
+		if enabled then
+			startAimBinding()
+		else
+			stopAimBinding()
+			restoreHighSizes()
+			local char = LocalPlayer.Character
+			if char then
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				if hum then
+					hum.AutoRotate = true
+				end
+			end
+		end
+	end
+})
 
-    local ownCharacter, ownHumanoid, ownRoot = getAliveCharacter(localPlayer)
-    local targetCharacter, _, targetRoot = getAliveCharacter(targetPlayer)
-    if not ownCharacter or not ownHumanoid or not ownRoot or not targetCharacter or not targetRoot then
-        return
-    end
-
-    local destination = destinationNearTarget(targetRoot, ownRoot)
-    pathBusy = true
-    lastPathAt = os.clock()
-
-    task.spawn(function()
-        local computedPath = nil
-        local ok = pcall(function()
-            local path = PathfindingService:CreatePath({
-                AgentRadius = 2,
-                AgentHeight = 5,
-                AgentCanJump = true,
-                AgentCanClimb = true,
-                WaypointSpacing = 4,
-            })
-            path:ComputeAsync(ownRoot.Position, destination)
-            if path.Status == Enum.PathStatus.Success then
-                computedPath = path
-            end
-        end)
-
-        -- Re-check every condition after ComputeAsync, which yields.
-        if tracking and hasTimebomb() and runToken == token
-            and lockedTarget == targetPlayer and localPlayer.Character == ownCharacter then
-            local currentTargetCharacter, _, currentTargetRoot = getAliveCharacter(targetPlayer)
-            local currentOwnCharacter, currentOwnHumanoid, currentOwnRoot = getAliveCharacter(localPlayer)
-            if currentTargetCharacter == targetCharacter and currentTargetRoot
-                and currentOwnCharacter == ownCharacter and currentOwnHumanoid and currentOwnRoot then
-                if ok and computedPath then
-                    local waypoints = computedPath:GetWaypoints()
-                    local waypoint = waypoints[2] or waypoints[1]
-                    if waypoint then
-                        if waypoint.Action == Enum.PathWaypointAction.Jump then
-                            currentOwnHumanoid.Jump = true
-                        end
-                        currentOwnHumanoid:MoveTo(waypoint.Position)
-                    else
-                        currentOwnHumanoid:MoveTo(destinationNearTarget(currentTargetRoot, currentOwnRoot))
-                    end
-                else
-                    -- Simple fallback when pathfinding cannot find a route.
-                    currentOwnHumanoid:MoveTo(destinationNearTarget(currentTargetRoot, currentOwnRoot))
-                end
-            end
-        end
-        pathBusy = false
-    end)
-end
-
-local function beginLock()
-    if not hasTimebomb() then
-        setToolStatus()
-        setStatus("TOOL REQUIRED", "Equip a Tool named Timebomb first", C.red)
-        return
-    end
-
-    local target = nearestPlayer()
-    if not target then
-        setStatus("NO TARGET", "No other living player was found", C.yellow)
-        return
-    end
-
-    lockedTarget = target
-    tracking = true
-    runToken += 1
-    lastPathAt = 0
-    targetName.Text = target.DisplayName .. "  (@" .. target.Name .. ")"
-    toggleButton.Text = "RELEASE TARGET  ×"
-    toggleButton.BackgroundColor3 = C.red
-    setToolStatus()
-    setStatus("TARGET LOCKED", "Following the first selected player", C.green)
-end
-
-toggleButton.MouseEnter:Connect(function()
-    if tracking then return end
-    TweenService:Create(toggleButton, TweenInfo.new(0.16), { BackgroundColor3 = Color3.fromRGB(121, 130, 255) }):Play()
-end)
-toggleButton.MouseLeave:Connect(function()
-    if tracking then return end
-    TweenService:Create(toggleButton, TweenInfo.new(0.16), { BackgroundColor3 = C.accent }):Play()
-end)
-toggleButton.Activated:Connect(function()
-    if tracking then
-        releaseLock("manual")
-    else
-        beginLock()
-    end
+connect(Players.PlayerRemoving, function(player)
+	originalHitboxSizes[player] = nil
+	originalHighSizes[player] = nil
+	removeESP(player)
 end)
 
--- Main monitor: never chooses a replacement target while a lock is active.
-task.spawn(function()
-    while gui.Parent do
-        task.wait(0.16)
-        setToolStatus()
-
-        if tracking then
-            if not hasTimebomb() then
-                releaseLock("tool")
-            elseif not lockedTarget then
-                releaseLock("manual")
-            else
-                local _, _, myRoot = getAliveCharacter(localPlayer)
-                local _, _, targetRoot = getAliveCharacter(lockedTarget)
-
-                if not myRoot then
-                    setStatus("WAITING FOR YOU", "Waiting for your character to respawn", C.yellow)
-                elseif not targetRoot then
-                    -- Keep the same player locked; never choose someone else as a replacement.
-                    setStatus("TARGET UNAVAILABLE", "Still locked • waiting for that player", C.yellow)
-                else
-                    local distance = (myRoot.Position - targetRoot.Position).Magnitude
-                    if distance <= 4.5 then
-                        setStatus("IN RANGE", "Locked target • staying close", C.green)
-                    else
-                        setStatus("FOLLOWING TARGET", "Locked • " .. tostring(math.floor(distance)) .. " studs away", C.green)
-                    end
-                    if os.clock() - lastDistanceUpdate >= 0.5 then
-                        lastDistanceUpdate = os.clock()
-                        requestPath(lockedTarget, runToken)
-                    end
-                end
-            end
-        end
-    end
+LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(0.5)
+	originalHitboxSizes[LocalPlayer] = nil
+	originalHighSizes[LocalPlayer] = nil
 end)
 
-setToolStatus()
-setStatus("STANDBY", "Equip Timebomb, then lock nearest", C.yellow)
+print("Full Script Loaded - Pro Dribble Engine Online")
